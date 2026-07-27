@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
-from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders, restock_orders, tasks, TASK_ID_START
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -13,6 +14,11 @@ QUARTER_MAP = {
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
+
+# Delivery lead time (in days) per demand trend. Increasing-demand items are
+# expedited; decreasing-demand items get the longest lead time.
+RESTOCK_LEAD_TIMES = {"increasing": 5, "stable": 10, "decreasing": 14}
+DEFAULT_LEAD_TIME = 10
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -89,6 +95,7 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +126,41 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+    trend: str
+    lead_time_days: int  # derived server-side from trend
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    created_date: str
+    expected_delivery: str
+    status: str
+    items: List[RestockOrderItem]
+    total_value: float
+    budget: float
+    lead_time_days: int  # overall = max item lead time
+
+class CreateRestockOrderRequest(BaseModel):
+    budget: float
+    items: List[dict]  # [{sku, name, quantity, unit_price, trend}]
+
+class Task(BaseModel):
+    id: int
+    title: str
+    priority: str
+    dueDate: str  # camelCase to match the client's mock task shape
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str
+    dueDate: str
 
 # API endpoints
 @app.get("/")
@@ -160,6 +202,103 @@ def get_order(order_id: str):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+@app.get("/api/restock-orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """Get restock orders submitted from the Restocking tab (newest first)"""
+    return list(reversed(restock_orders))
+
+@app.post("/api/restock-orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Create a restock order from recommended demand-forecast items.
+
+    Lead time and delivery dates are computed server-side so the trend->lead-time
+    policy stays authoritative regardless of what the client sends.
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Cannot submit a restock order with no items")
+
+    # Derive a lead time per item from its demand trend, then build the line items.
+    built_items = []
+    for item in request.items:
+        trend = item.get("trend", "")
+        lead_time_days = RESTOCK_LEAD_TIMES.get(trend, DEFAULT_LEAD_TIME)
+        built_items.append(RestockOrderItem(
+            sku=item.get("sku", ""),
+            name=item.get("name", ""),
+            quantity=item.get("quantity", 0),
+            unit_price=item.get("unit_price", 0.0),
+            trend=trend,
+            lead_time_days=lead_time_days,
+        ))
+
+    total_value = sum(i.quantity * i.unit_price for i in built_items)
+    # Order-level lead time / delivery is driven by the slowest line item.
+    overall_lead_time = max(i.lead_time_days for i in built_items)
+    created = datetime.now()
+    expected_delivery = created + timedelta(days=overall_lead_time)
+
+    seq = len(restock_orders) + 1
+    restock_order = RestockOrder(
+        id=f"restock-{seq}",
+        order_number=f"RESTOCK-2025-{seq:04d}",
+        created_date=created.isoformat(),
+        expected_delivery=expected_delivery.isoformat(),
+        status="Submitted",
+        items=built_items,
+        total_value=total_value,
+        budget=request.budget,
+        lead_time_days=overall_lead_time,
+    )
+    restock_orders.append(restock_order.model_dump())
+    return restock_order
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """Get tasks created via the profile Tasks modal (newest first).
+
+    These are separate from the static mock tasks the client renders for the
+    current user; the client merges both lists for display.
+    """
+    return list(reversed(tasks))
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+def create_task(request: CreateTaskRequest):
+    """Create a task. The client optimistically prepends the returned task."""
+    if not request.title.strip():
+        raise HTTPException(status_code=400, detail="Task title cannot be empty")
+
+    # Derive the next id from the current max (not len) so ids stay unique even
+    # after deletions. Floor at TASK_ID_START to avoid colliding with the
+    # client's static mock task ids.
+    next_id = max((t["id"] for t in tasks), default=TASK_ID_START - 1) + 1
+    task = Task(
+        id=next_id,
+        title=request.title.strip(),
+        priority=request.priority,
+        dueDate=request.dueDate,
+        status="pending",
+    )
+    tasks.append(task.model_dump())
+    return task
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: int):
+    """Toggle a task's status between pending and completed."""
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: int):
+    """Delete a task."""
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks.remove(task)
+    return {"success": True, "id": task_id}
 
 @app.get("/api/demand", response_model=List[DemandForecast])
 def get_demand_forecasts():

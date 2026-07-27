@@ -35,5 +35,17 @@ recent_transactions = load_json_file('transactions.json')
 # Load purchase orders
 purchase_orders = load_json_file('purchase_orders.json')
 
+# Restock orders are created at runtime via POST /api/restock-orders.
+# Kept in-memory only (not loaded from / persisted to a JSON file), so the
+# list resets on server restart — consistent with this demo's no-DB design.
+restock_orders = []
+
+# Tasks created at runtime via POST /api/tasks (from the profile Tasks modal).
+# In-memory only, resets on restart. The frontend also shows a few static mock
+# tasks (ids 1-4) sourced client-side; to keep the client's mock-vs-API routing
+# unambiguous, API-generated task ids start at 1000 so they never collide.
+tasks = []
+TASK_ID_START = 1000
+
 # All data is now loaded from JSON files in the data/ directory
 # This allows for easier maintenance and updates of the sample data
